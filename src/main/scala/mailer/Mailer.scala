@@ -1,114 +1,81 @@
 package mailer
-import javax.mail.internet.MimeMultipart
-import javax.mail.{MessagingException, Session, Transport}
 
-/**
-	* Represents the ''Mailer'' itself, with methods for opening/closing the connection and sending
-	*/
-trait Mailer {
+import cats.effect.kernel.Temporal
+import cats.effect.{Async, Sync}
+import cats.implicits._
+import exception.DeliverFailure.AuthenticationFailed
+import exception.InvalidAddress
+import mailer.Props.SmtpConnectionTimeoutKey
+import org.typelevel.log4cats.Logger
+import retries.Retry
+import retry.RetryPolicies.{exponentialBackoff, limitRetries}
+import retry.RetryPolicy
 
-	/**
-		* Creates new transport connection.
-		*/
-	@throws[MessagingException]
-	def connect(): Mailer
+import java.util.Properties
+import javax.mail.Message.RecipientType._
+import javax.mail._
+import javax.mail.internet.{InternetAddress, MimeMessage}
+import scala.concurrent.duration.DurationInt
+import scala.jdk.CollectionConverters.MapHasAsJava
 
-	/**
-		* Sends the given message.
-		*
-		* @param msg message to send
-		*/
-	@throws[MessagingException]
-	def send(msg: Message): Mailer
+trait Mailer[F[_]] {
+  def send(email: Email): F[Unit]
 
-	/**
-		* Returns the instance of `javax.mail.Transport`, used by this instance of 'Mailer'
-		*
-		* @return instance of `javax.mail.Transport`
-		*/
-	def transport: Transport
-
-	/**
-		* Closes the previously opened transport connection.
-		*
-		* @return
-		*/
-	@throws[MessagingException]
-	def close(): Mailer
 }
-
-
-/**
- * ''Mailer'' object providing default operations to handle the transport connection and send the
- * e-mail message.
- *
- * @author jubu
- */
 object Mailer {
+  def apply[F[_]: Async: Logger: Temporal](props: Props, credentials: Credentials): Mailer[F] =
+    new MailerImpl[F](props, credentials)
 
-  import MailKeys._
-
-  /**
-   * Sets the ''JavaMail'' session to the ''Mailer'' and returns the instance ready to send e-mail
-   * messages. Optionally, transport method can be explicitly specified.
-   *
-   * @param session      ''JavaMail'' session
-   * @param transportOpt transport method (optional)
-   * @return ''Mailer'' instance
-   */
-  def apply(session: Session, transportOpt: Option[Transport] = None): Mailer = new Mailer {
-
-
-    val trt: Transport = transportOpt match {
-      case None => if (session.getProperty(TransportProtocolKey) == null) {
-        println("::::")
-        session.getTransport("smtp")
-      } else {
-        println(":::::")
-        session.getTransport
-      }
-      case Some(t) =>
-        println("::::::")
-        t
+  class MailerImpl[F[_]: Async: Logger: Temporal](props: Props, credentials: Credentials) extends Mailer[F] {
+    private[mailer] val retryPolicy: RetryPolicy[F] = {
+      val delay = props.values.get(SmtpConnectionTimeoutKey).fold(1.second)(_.toInt.millis)
+      limitRetries[F](3) |+| exponentialBackoff[F](delay)
     }
 
-    @throws[MessagingException]
-    override def connect(): Mailer = {
-      if (!trt.isConnected) {
-        println(":")
-        trt.connect()
-      }
-      this
+    private[mailer] val properties: Properties = {
+      val properties = System.getProperties
+      properties.putAll(props.values.asJava)
+      properties
     }
 
-    @throws[MessagingException]
-    override def send(msg: Message): Mailer = {
-      import javax.mail.{Message => M}
-      connect()
+    private[mailer] val authenticator: F[Authenticator] =
+      Sync[F].delay(
+        new Authenticator {
+          override def getPasswordAuthentication: PasswordAuthentication = {
+            new PasswordAuthentication(credentials.user.value, credentials.password.value)
+          }
+        }
+      )
+
+    private[mailer] def session(properties: Properties, auth: Authenticator): F[Session] =
+      Sync[F].delay(Session.getDefaultInstance(properties, auth))
+
+    private[mailer] def prepareMessage(session: Session, email: Email): MimeMessage = {
       val message = new MimeMessage(session)
-      println("::")
-      msg.to.foreach(message.addRecipient(M.RecipientType.TO, _))
-      msg.cc.foreach(message.addRecipient(M.RecipientType.CC, _))
-      msg.bcc.foreach(message.addRecipient(M.RecipientType.BCC, _))
-      msg.headers.foreach(header => message.setHeader(header.name, header.value))
-      message.setSubject(msg.subject)
-      message.setFrom(msg.from)
-      message.setContent(new MimeMultipart() {
-        msg.content.parts.foreach(addBodyPart(_))
-      })
-      println(":::")
-      trt.sendMessage(message, message.getAllRecipients)
-      this
+      message.setFrom(new InternetAddress(email.from.value))
+      email.to.map(ads => message.addRecipient(TO, new InternetAddress(ads.value)))
+      email.cc.foreach(ads => message.addRecipient(CC, new InternetAddress(ads.value)))
+      email.bcc.foreach(ads => message.addRecipient(BCC, new InternetAddress(ads.value)))
+      message.setSubject(email.subject)
+      message.setText(email.content.value, email.content.charset.toString, email.content.subtype.value)
+      message
     }
 
-    override def transport: Transport = trt
+    override def send(email: Email): F[Unit] =
+      for {
+        auth    <- authenticator
+        session <- session(properties, auth)
+        message = prepareMessage(session, email)
+        task    = Sync[F].delay(Transport.send(message))
+        result <- Retry[F]
+          .retry(retryPolicy)(task)
+          .adaptError {
+            case exception: AuthenticationFailedException =>
+              AuthenticationFailed(exception.getMessage)
+            case exception: SendFailedException =>
+              InvalidAddress(exception.getMessage)
+          }
+      } yield result
 
-    @throws[MessagingException]
-    override def close(): Mailer = {
-      if (trt.isConnected) {
-        trt.close()
-      }
-      this
-    }
   }
 }
